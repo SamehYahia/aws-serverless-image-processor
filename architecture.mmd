@@ -1,6 +1,19 @@
 flowchart LR
-    U[User] -->|Upload image| S[(S3 source bucket)]
-    S -->|ObjectCreated event| L[AWS Lambda + Pillow]
+    U[User or demo client] -->|POST filename and type| API[API Gateway HTTP API]
+    API --> P[Presign Lambda]
+    P -->|Short-lived upload form| U
+    U -->|Multipart upload| S[(Private source S3 bucket)]
+    S -->|ObjectCreated event| Q[SQS image jobs queue]
+    Q -->|Retry exhaustion| DLQ[(Dead-letter queue)]
+    Q --> D[Workflow starter Lambda]
+    D -->|Start execution| SF[Step Functions standard workflow]
+    SF -->|Process task| L[Image processor Lambda and Pillow]
     L -->|Read original| S
-    L -->|Write resized image| D[(S3 processed bucket)]
-    L -->|Logs and errors| C[Amazon CloudWatch Logs]
+    L -->|Watermarked image and thumbnail| O[(Private processed S3 bucket)]
+    SF -->|Save result| DB[(DynamoDB metadata)]
+    SF -->|Success or failure| SNS[SNS status topic]
+    CF[CloudFront with OAC] -->|Private origin access| O
+    U -->|View processed image| CF
+    DLQ --> CW[CloudWatch alarm and logs]
+    D --> CW
+    L --> CW

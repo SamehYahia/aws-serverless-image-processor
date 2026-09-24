@@ -1,18 +1,34 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Private S3 image upload and serverless resize pipeline.
+Description: Event-driven image upload, processing, and delivery graduation project.
 
 Parameters:
   BucketNameSuffix:
     Type: String
-    Description: Lowercase, globally unique suffix for the two S3 bucket names.
+    Description: Lowercase globally unique suffix used in S3 bucket names.
     AllowedPattern: '[a-z0-9-]{3,20}'
 
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    MemorySize: 1024
+    Timeout: 60
+    Tracing: Active
+    Environment:
+      Variables:
+        MAX_IMAGE_BYTES: '10485760'
+        MAX_IMAGE_DIMENSION: '1200'
+        THUMBNAIL_DIMENSION: '320'
+        WATERMARK_TEXT: AWS SAA Graduation Project
+
 Resources:
-  SourceBucket:
+  UploadsBucket:
     Type: AWS::S3::Bucket
+    DependsOn: ImageJobsQueuePolicy
     Properties:
-      BucketName: !Sub '${AWS::StackName}-source-${BucketNameSuffix}'
+      BucketName: !Sub '${AWS::StackName}-uploads-${BucketNameSuffix}'
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -25,8 +41,24 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOriginalUploads
+            Status: Enabled
+            Filter:
+              Prefix: uploads/
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt ImageJobsQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
 
-  ProcessedBucket:
+  ProcessedImagesBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub '${AWS::StackName}-processed-${BucketNameSuffix}'
@@ -42,49 +74,401 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireProcessedImages
+            Status: Enabled
+            Filter:
+              Prefix: processed/
+            ExpirationInDays: 90
+          - Id: ExpireThumbnails
+            Status: Enabled
+            Filter:
+              Prefix: thumbnails/
+            ExpirationInDays: 90
 
-  ImageProcessorFunction:
+  ImageJobsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  ImageJobsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 390
+      MessageRetentionPeriod: 345600
+      MaximumMessageSize: 262144
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageJobsDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  ImageJobsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ImageJobsQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOnlyUploadsBucketNotifications
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ImageJobsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${AWS::StackName}-uploads-${BucketNameSuffix}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  UploadApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+
+  PresignUploadFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub '${AWS::StackName}-image-processor'
+      FunctionName: !Sub '${AWS::StackName}-presign-upload'
       CodeUri: src/
-      Handler: app.handler
-      Runtime: python3.12
-      Architectures:
-        - x86_64
-      MemorySize: 1024
-      Timeout: 60
-      EphemeralStorage:
-        Size: 512
+      Handler: presign.handler
+      MemorySize: 256
+      Timeout: 10
       Environment:
         Variables:
-          DESTINATION_BUCKET: !Ref ProcessedBucket
-          MAX_IMAGE_BYTES: '10485760'
-          MAX_IMAGE_DIMENSION: '1200'
+          UPLOADS_BUCKET: !Ref UploadsBucket
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref SourceBucket
-        - S3WritePolicy:
-            BucketName: !Ref ProcessedBucket
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${UploadsBucket.Arn}/uploads/*'
       Events:
-        SourceUpload:
-          Type: S3
+        RequestUpload:
+          Type: HttpApi
           Properties:
-            Bucket: !Ref SourceBucket
-            Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: uploads/
+            ApiId: !Ref UploadApi
+            Path: /uploads
+            Method: POST
+
+  WorkflowStarterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-workflow-starter'
+      CodeUri: src/
+      Handler: dispatch.handler
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref ImageWorkflow
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref ImageWorkflow
+            - Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+                - sqs:ChangeMessageVisibility
+              Resource: !GetAtt ImageJobsQueue.Arn
+      Events:
+        ImageJobs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ImageJobsQueue.Arn
+            BatchSize: 5
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  ProcessImageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-process-image'
+      CodeUri: src/
+      Handler: process.handler
+      MemorySize: 1536
+      Timeout: 60
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref UploadsBucket
+          PROCESSED_BUCKET: !Ref ProcessedImagesBucket
+          CLOUDFRONT_DOMAIN: !GetAtt ImagesDistribution.DomainName
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${UploadsBucket.Arn}/uploads/*'
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub '${ProcessedImagesBucket.Arn}/processed/*'
+                - !Sub '${ProcessedImagesBucket.Arn}/thumbnails/*'
+
+  ImageMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: imageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: imageId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ProcessingNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Image processing status
+
+  ImageWorkflow:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub '${AWS::StackName}-image-workflow'
+      Type: STANDARD
+      Tracing:
+        Enabled: true
+      DefinitionSubstitutions:
+        ProcessorFunctionArn: !GetAtt ProcessImageFunction.Arn
+        MetadataTableName: !Ref ImageMetadataTable
+        NotificationsTopicArn: !Ref ProcessingNotificationsTopic
+      Definition:
+        StartAt: ProcessImage
+        States:
+          ProcessImage:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: '${ProcessorFunctionArn}'
+              Payload.$: '$'
+            OutputPath: $.Payload
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.processingError
+                Next: NotifyFailure
+            Next: SaveMetadata
+          SaveMetadata:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:putItem
+            Parameters:
+              TableName: '${MetadataTableName}'
+              Item:
+                imageId:
+                  S.$: $.imageId
+                sourceBucket:
+                  S.$: $.sourceBucket
+                sourceKey:
+                  S.$: $.sourceKey
+                processedKey:
+                  S.$: $.processedKey
+                thumbnailKey:
+                  S.$: $.thumbnailKey
+                imageUrl:
+                  S.$: $.imageUrl
+                thumbnailUrl:
+                  S.$: $.thumbnailUrl
+                width:
+                  N.$: States.Format('{}', $.width)
+                height:
+                  N.$: States.Format('{}', $.height)
+                status:
+                  S: COMPLETE
+                createdAt:
+                  S.$: $.createdAt
+                expiresAt:
+                  N.$: $.expiresAt
+            ResultPath: null
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                ResultPath: $.processingError
+                Next: NotifyFailure
+            Next: NotifyCompletion
+          NotifyCompletion:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: '${NotificationsTopicArn}'
+              Subject: Image processing complete
+              Message.$: States.JsonToString($)
+            End: true
+          NotifyFailure:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: '${NotificationsTopicArn}'
+              Subject: Image processing failed
+              Message.$: States.JsonToString($.processingError)
+            Next: ProcessingFailed
+          ProcessingFailed:
+            Type: Fail
+            Error: ImageProcessingFailed
+            Cause: Processing failed; see the SNS notification and Step Functions execution details.
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt ProcessImageFunction.Arn
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt ImageMetadataTable.Arn
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref ProcessingNotificationsTopic
+
+  ImagesOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-images-oac'
+        Description: Private S3 origin for processed project images.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ImagesDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} processed image delivery'
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: ProcessedImagesOrigin
+            DomainName: !GetAtt ProcessedImagesBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt ImagesOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: ProcessedImagesOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  ProcessedImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProcessedImagesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOfProcessedImages
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource:
+              - !Sub '${ProcessedImagesBucket.Arn}/processed/*'
+              - !Sub '${ProcessedImagesBucket.Arn}/thumbnails/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${ImagesDistribution}'
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: One or more image jobs reached the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ImageJobsDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  PresignFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-presign-upload'
+      RetentionInDays: 14
+
+  WorkflowStarterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-workflow-starter'
+      RetentionInDays: 14
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-process-image'
+      RetentionInDays: 14
 
 Outputs:
-  SourceBucketName:
-    Description: Upload JPEG or PNG images under uploads/ in this bucket.
-    Value: !Ref SourceBucket
-  ProcessedBucketName:
-    Description: Resized images are written under processed/ in this bucket.
-    Value: !Ref ProcessedBucket
-  FunctionName:
-    Description: Lambda function that validates and resizes uploaded images.
-    Value: !Ref ImageProcessorFunction
+  UploadApiUrl:
+    Description: POST a JSON filename and contentType to request a time-limited S3 upload form.
+    Value: !Sub 'https://${UploadApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/uploads'
+  UploadsBucketName:
+    Description: Private source bucket for uploaded images.
+    Value: !Ref UploadsBucket
+  ProcessedImagesBucketName:
+    Description: Private destination bucket for watermarked images and thumbnails.
+    Value: !Ref ProcessedImagesBucket
+  ImageJobsQueueName:
+    Description: SQS queue buffering new image jobs.
+    Value: !GetAtt ImageJobsQueue.QueueName
+  ImageJobsDeadLetterQueueName:
+    Description: Queue for image jobs that could not be dispatched after retries.
+    Value: !GetAtt ImageJobsDeadLetterQueue.QueueName
+  ImageWorkflowArn:
+    Description: Step Functions state machine coordinating image work.
+    Value: !Ref ImageWorkflow
+  MetadataTableName:
+    Description: DynamoDB table storing completed image metadata.
+    Value: !Ref ImageMetadataTable
+  NotificationsTopicArn:
+    Description: SNS topic for completion and workflow failure notifications.
+    Value: !Ref ProcessingNotificationsTopic
+  CloudFrontDomainName:
+    Description: Domain serving processed images from the private S3 origin.
+    Value: !GetAtt ImagesDistribution.DomainName
