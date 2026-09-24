@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Private S3 image upload and serverless resize pipeline.
+
+Parameters:
+  BucketNameSuffix:
+    Type: String
+    Description: Lowercase, globally unique suffix for the two S3 bucket names.
+    AllowedPattern: '[a-z0-9-]{3,20}'
+
+Resources:
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-source-${BucketNameSuffix}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-processed-${BucketNameSuffix}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ImageProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-image-processor'
+      CodeUri: src/
+      Handler: app.handler
+      Runtime: python3.12
+      Architectures:
+        - x86_64
+      MemorySize: 1024
+      Timeout: 60
+      EphemeralStorage:
+        Size: 512
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref ProcessedBucket
+          MAX_IMAGE_BYTES: '10485760'
+          MAX_IMAGE_DIMENSION: '1200'
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - S3WritePolicy:
+            BucketName: !Ref ProcessedBucket
+      Events:
+        SourceUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref SourceBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+
+Outputs:
+  SourceBucketName:
+    Description: Upload JPEG or PNG images under uploads/ in this bucket.
+    Value: !Ref SourceBucket
+  ProcessedBucketName:
+    Description: Resized images are written under processed/ in this bucket.
+    Value: !Ref ProcessedBucket
+  FunctionName:
+    Description: Lambda function that validates and resizes uploaded images.
+    Value: !Ref ImageProcessorFunction
