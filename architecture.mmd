@@ -1,0 +1,6 @@
+flowchart LR
+    U[User] -->|Upload image| S[(S3 source bucket)]
+    S -->|ObjectCreated event| L[AWS Lambda + Pillow]
+    L -->|Read original| S
+    L -->|Write resized image| D[(S3 processed bucket)]
+    L -->|Logs and errors| C[Amazon CloudWatch Logs]
