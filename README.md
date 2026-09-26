@@ -4,6 +4,10 @@ Graduation project for AWS Solutions Architect - Associate. The system accepts a
 
 ## Architecture
 
+![Serverless image processing architecture using official AWS service icons](docs/architecture.png)
+
+Download the [architecture diagram (PNG)](docs/architecture.png). The image uses official icons from the [AWS Architecture Icons package](https://aws.amazon.com/architecture/icons/). Its editable Mermaid source is also available as [`architecture.mmd`](architecture.mmd).
+
 ```mermaid
 flowchart LR
     U[User or demo client] -->|POST filename and type| API[API Gateway HTTP API]
@@ -26,7 +30,7 @@ flowchart LR
     L --> CW
 ```
 
-The diagram is also available as [`architecture.mmd`](architecture.mmd). CloudFront serves only processed images and thumbnails; both S3 buckets block public access.
+CloudFront serves only processed images and thumbnails; both S3 buckets block public access.
 
 ## What it does
 
@@ -54,9 +58,13 @@ The diagram is also available as [`architecture.mmd`](architecture.mmd). CloudFr
 ├── README.md
 ├── architecture.mmd
 ├── template.yaml
+├── assets/
+│   └── aws-icons/
 ├── docs/
+│   ├── architecture.png
 │   └── presentation-guide.md
 ├── scripts/
+│   ├── render_architecture.py
 │   └── upload_image.py
 └── src/
     ├── dispatch.py
@@ -113,7 +121,7 @@ The stack also creates an API, queues, Lambdas, a state machine, a DynamoDB tabl
 
 ## Submission and presentation
 
-The course handout's required deliverables are an architecture diagram and a public GitHub repository with the project documentation in this README. A deployed URL or recorded demo is optional but encouraged. See [`docs/presentation-guide.md`](docs/presentation-guide.md) for a short walkthrough and review checklist.
+The course handout's required deliverables are an architecture diagram and a public GitHub repository with the project documentation in this README. The diagram is provided as a PNG using official AWS service icons. A deployed URL or recorded demo is optional but encouraged. See [`docs/presentation-guide.md`](docs/presentation-guide.md) for a short walkthrough and review checklist.
 
 ## Scope
 
